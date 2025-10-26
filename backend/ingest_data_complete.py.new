@@ -1,0 +1,267 @@
+import pandas as pd
+import os
+from sqlalchemy import create_engine
+from app import db, Species, Illustrations, Names, Frequency
+from dotenv import load_dotenv
+from utils import convert_google_drive_link
+
+load_dotenv()
+
+class DataIngestion:
+    def __init__(self):
+        self.engine = create_engine(os.getenv('DATABASE_URL', 'sqlite:///pocketguide.db'))
+        self.bird_types = {
+            'default': 'Arboreal Birds',
+            'water': ['Duck', 'Goose', 'Grebe', 'Cormorant', 'Heron', 'Egret', 'Stork', 'Ibis', 'Flamingo', 'Watercock', 'Waterhen'],
+            'raptor': ['Eagle', 'Hawk', 'Kite', 'Falcon', 'Harrier', 'Buzzard', 'Owl', 'Vulture', 'Osprey'],
+            'ground': ['Quail', 'Partridge', 'Francolin', 'Peafowl', 'Junglefowl', 'Pipit', 'Lark', 'Babbler', 'Dove', 'Pigeon', 'Bulbul'],
+            'wetland': ['Kingfisher', 'Sandpiper', 'Plover', 'Lapwing', 'Snipe', 'Godwit', 'Crane', 'Heron', 'Stork', 'Duck', 'Teal']
+        }
+
+    def categorize_bird(self, bird_name, scientific_name=None):
+        """Categorize bird based on its name and scientific name"""
+        if not bird_name:
+            return self.bird_types['default']
+        
+        bird_name_lower = bird_name.lower()
+        
+        # Special categorizations based on common names
+        if 'laughingthrush' in bird_name_lower or 'babbler' in bird_name_lower or 'yuhina' in bird_name_lower:
+            return 'Babblers & Laughingthrushes'
+        elif 'warbler' in bird_name_lower:
+            return 'Warblers'
+        elif 'flycatcher' in bird_name_lower:
+            return 'Flycatchers'
+        elif 'thrush' in bird_name_lower or 'robin' in bird_name_lower:
+            return 'Thrushes'
+        elif 'sunbird' in bird_name_lower:
+            return 'Sunbirds'
+        elif 'kingfisher' in bird_name_lower:
+            return 'Kingfishers'
+        elif 'eagle' in bird_name_lower or 'hawk' in bird_name_lower or 'falcon' in bird_name_lower or 'kite' in bird_name_lower:
+            return 'Raptors'
+        elif 'owl' in bird_name_lower:
+            return 'Owls'
+        elif 'woodpecker' in bird_name_lower:
+            return 'Woodpeckers'
+        elif 'pigeon' in bird_name_lower or 'dove' in bird_name_lower:
+            return 'Pigeons & Doves'
+        elif 'bulbul' in bird_name_lower:
+            return 'Bulbuls'
+        
+        # General categorization based on keywords
+        for category, keywords in self.bird_types.items():
+            if category == 'default':
+                continue
+            if isinstance(keywords, list):
+                for keyword in keywords:
+                    if keyword.lower() in bird_name_lower:
+                        if category == 'water':
+                            return 'Water Birds'
+                        elif category == 'raptor':
+                            return 'Raptors'
+                        elif category == 'ground':
+                            return 'Ground Birds'
+                        elif category == 'wetland':
+                            return 'Wetland Birds'
+
+        return self.bird_types['default']
+
+    def ingest_all_data(self, species_csv, frequency_csv, google_drive_csv=None):
+        """Main ingestion function that processes all CSV files"""
+        # Note: We're already in the app context from the calling function
+        
+        # Step 1: Load all CSV files
+        print("Loading CSV files...")
+        species_df = pd.read_csv(species_csv)
+        frequency_df = pd.read_csv(frequency_csv)
+
+        # Optional: Load Google Drive inventory if provided
+        drive_inventory = {}
+        if google_drive_csv and os.path.exists(google_drive_csv):
+            drive_df = pd.read_csv(google_drive_csv)
+            for _, row in drive_df.iterrows():
+                filename = row['FileName']
+                link = convert_google_drive_link(row['ShareableLink'])
+                drive_inventory[filename] = link
+            print(f"Loaded {len(drive_inventory)} images from Google Drive inventory")
+
+        # Step 2: Process species and create master species records
+        print("Processing species data...")
+        processed_species = set()
+        missing_scientific_names = []
+
+        for _, row in species_df.iterrows():
+            english_name = row['English Name'].strip() if 'English Name' in row else None
+            if not english_name:
+                print("Warning: Found row with missing English Name, skipping")
+                continue
+                
+            if english_name in processed_species:
+                print(f"Warning: Duplicate species entry found for '{english_name}', skipping")
+                continue
+
+            processed_species.add(english_name)
+            
+            # Extract data from species row
+            scientific_name = row.get('Scientific Name', '').strip() if 'Scientific Name' in row else ''
+            if not scientific_name:
+                missing_scientific_names.append(english_name)
+                scientific_name = "Unknown"  # Placeholder for missing scientific names
+            
+            bird_type = self.categorize_bird(english_name, scientific_name)
+            taxa = 'Birds'  # Default taxa
+            size = row.get('Size', '').strip() if 'Size' in row else ''
+            
+            # Create Species record
+            species = Species(
+                english_name=english_name,
+                scientific_name=scientific_name,
+                type=bird_type,
+                taxa=taxa,
+                size=size
+            )
+            db.session.add(species)
+            print(f"Added species: {english_name} ({scientific_name})")
+
+        if missing_scientific_names:
+            print(f"\nWarning: {len(missing_scientific_names)} species missing scientific names")
+            for name in missing_scientific_names[:5]:  # Show first 5
+                print(f"  - {name}")
+            if len(missing_scientific_names) > 5:
+                print(f"  - ...and {len(missing_scientific_names) - 5} more")
+
+        # Commit species first to ensure foreign key constraints are met
+        db.session.commit()
+        print("Species data committed.")
+
+        # Step 3: Process illustrations
+        print("\nProcessing illustrations...")
+        species_without_images = []
+        
+        for _, row in species_df.iterrows():
+            english_name = row['English Name'].strip() if 'English Name' in row else None
+            if not english_name:
+                continue
+            
+            # Look for image link directly in CSV or in drive inventory
+            image_name = row.get('Image File Name', f"{english_name}.png") if 'Image File Name' in row else f"{english_name}.png"
+            image_link = row.get('Image Link', '') if 'Image Link' in row else ''
+            
+            # Try to find the image in the drive inventory by filename
+            if not image_link and image_name in drive_inventory:
+                image_link = drive_inventory[image_name]
+            
+            # Try to find the image by English name if no direct match
+            if not image_link:
+                for filename, link in drive_inventory.items():
+                    if english_name in filename:
+                        image_name = filename
+                        image_link = link
+                        break
+            
+            # If we found an image link, create an illustration
+            if image_link:
+                # Convert Google Drive link to direct URL if needed
+                direct_link = convert_google_drive_link(image_link)
+                
+                illustration = Illustrations(
+                    image_name=image_name,
+                    image_link=direct_link,
+                    species_english_name=english_name,
+                    sex=row.get('Sex', '') if 'Sex' in row else '',
+                    breeding_status=row.get('Breeding Status', '') if 'Breeding Status' in row else '',
+                    subspecies=row.get('Subspecies', '') if 'Subspecies' in row else '',
+                    is_default=True  # Making the first image the default
+                )
+                db.session.add(illustration)
+                print(f"Added illustration for: {english_name}")
+            else:
+                species_without_images.append(english_name)
+                print(f"Warning: No image found for: {english_name}")
+
+        if species_without_images:
+            print(f"\nWarning: {len(species_without_images)} species without images")
+            for name in species_without_images[:5]:  # Show first 5
+                print(f"  - {name}")
+            if len(species_without_images) > 5:
+                print(f"  - ...and {len(species_without_images) - 5} more")
+
+        # Step 4: Process local names (Mizo names)
+        print("\nProcessing local names...")
+        for _, row in species_df.iterrows():
+            english_name = row['English Name'].strip() if 'English Name' in row else None
+            if not english_name:
+                continue
+            
+            # Check for Mizo name
+            if 'Mizo Name' in row and row['Mizo Name']:
+                mizo_name = row['Mizo Name']
+                name = Names(
+                    species_english_name=english_name,
+                    language='Mizo',
+                    name=mizo_name
+                )
+                db.session.add(name)
+                print(f"Added Mizo name for: {english_name}")
+
+        # Step 5: Process frequency data
+        print("\nProcessing frequency data...")
+        for _, row in frequency_df.iterrows():
+            if 'English Name' not in row or not row['English Name']:
+                print("Warning: Found frequency entry with missing English Name, skipping")
+                continue
+            
+            english_name = row['English Name'].strip()
+            
+            # Check if this species exists in our database
+            species = Species.query.filter_by(english_name=english_name).first()
+            if not species:
+                print(f"Warning: Frequency data for unknown species: {english_name}, skipping")
+                continue
+            
+            state = row['State'] if 'State' in row else 'Unknown'
+            district = row.get('District', 'Statewide') if 'District' in row else 'Statewide'
+            
+            try:
+                frequency_rank = int(row['Frequency Rank']) if 'Frequency Rank' in row else 9999
+            except (ValueError, TypeError):
+                print(f"Warning: Invalid Frequency Rank for {english_name}, using 9999")
+                frequency_rank = 9999
+            
+            try:
+                observation_count = int(row.get('Observation Count', 0)) if 'Observation Count' in row else 0
+            except (ValueError, TypeError):
+                observation_count = 0
+            
+            seasonality = row.get('Seasonality', '') if 'Seasonality' in row else ''
+            
+            frequency = Frequency(
+                english_name=english_name,
+                state=state,
+                district=district,
+                frequency_rank=frequency_rank,
+                observation_count=observation_count,
+                seasonality=seasonality
+            )
+            db.session.add(frequency)
+            print(f"Added frequency data for: {english_name} in {district}, {state}")
+
+        # Final commit
+        db.session.commit()
+        print("All data ingestion completed successfully!")
+
+        # Print summary
+        total_species = Species.query.count()
+        total_illustrations = Illustrations.query.count()
+        total_names = Names.query.count()
+        total_frequency = Frequency.query.count()
+
+        print(f"\nIngestion Summary:")
+        print(f"Total Species: {total_species}")
+        print(f"Total Illustrations: {total_illustrations}")
+        print(f"Total Local Names: {total_names}")
+        print(f"Total Frequency Records: {total_frequency}")
+        
+        print(f"\nPercentage with images: {(total_illustrations/total_species)*100:.1f}% ({total_illustrations}/{total_species})")
+        print(f"Percentage with local names: {(total_names/total_species)*100:.1f}% ({total_names}/{total_species})")

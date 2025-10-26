@@ -1,0 +1,24 @@
+# Docker Compose Development Configuration
+# Extends the base docker-compose.yml with development-specific settings
+
+version: "3.8"
+
+services:
+  backend:
+    environment:
+      - FLASK_ENV=development
+      - FLASK_DEBUG=1
+    volumes:
+      - ./backend:/app
+    # Use flask development server in dev mode
+    command: flask run --host=0.0.0.0
+
+  frontend:
+    environment:
+      - NODE_ENV=development
+      - CHOKIDAR_USEPOLLING=true # Enable hot-reload on Windows/Docker
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    # Use development server with hot-reload
+    command: npm start
